@@ -14,6 +14,7 @@ from transformers import AutoTokenizer
 
 from k_model import ModelConfig, Transformer
 from dataset import SFTDataset
+from adaptive_weighting import create_adaptive_weighting_module
 
 import swanlab
 
@@ -64,9 +65,23 @@ def train_epoch(epoch):
         # 前向传播
         with ctx:
             out = model(X, Y)
-            loss = out.last_loss / args.accumulation_steps
-            loss_mask = loss_mask.view(-1)
-            loss = torch.sum(loss * loss_mask) / loss_mask.sum()
+            
+            # 使用自适应加权损失计算
+            if args.use_adaptive_weighting:
+                # 生成样本ID（使用step和batch内索引）
+                sample_ids = [epoch * len(train_loader) * args.batch_size + step * args.batch_size + i 
+                             for i in range(X.shape[0])]
+                
+                # 计算自适应加权损失
+                weighted_loss, sample_weights = adaptive_weighting_module.compute_weighted_loss(
+                    out.logits, Y, loss_mask, sample_ids
+                )
+                loss = weighted_loss / args.accumulation_steps
+            else:
+                # 使用原始损失计算
+                loss = out.last_loss / args.accumulation_steps
+                loss_mask = loss_mask.view(-1)
+                loss = torch.sum(loss * loss_mask) / loss_mask.sum()
 
         # 反向传播
         scaler.scale(loss).backward()
@@ -84,20 +99,39 @@ def train_epoch(epoch):
         # 打印日志
         if step % args.log_interval == 0:
             spend_time = time.time() - start_time
-            Logger(
-                'Epoch:[{}/{}]({}/{}) loss:{:.3f} lr:{:.7f} epoch_Time:{}min:'.format(
-                    epoch + 1,
-                    args.epochs,
-                    step,
-                    iter_per_epoch,
-                    loss.item() * args.accumulation_steps,
-                    optimizer.param_groups[-1]['lr'],
-                    spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60))
+            log_msg = 'Epoch:[{}/{}]({}/{}) loss:{:.3f} lr:{:.7f} epoch_Time:{}min:'.format(
+                epoch + 1,
+                args.epochs,
+                step,
+                iter_per_epoch,
+                loss.item() * args.accumulation_steps,
+                optimizer.param_groups[-1]['lr'],
+                spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60)
+            
+            # 添加自适应权重信息
+            if args.use_adaptive_weighting and step > 0:
+                weight_stats = adaptive_weighting_module.get_sample_statistics()
+                if weight_stats:
+                    avg_weight = sum([s['contribution'] for s in weight_stats.values()]) / len(weight_stats)
+                    log_msg += f' avg_weight:{avg_weight:.3f}'
+            
+            Logger(log_msg)
+            
             if args.use_swanlab:
-                swanlab.log({
+                swanlab_data = {
                     "loss": loss.item() * args.accumulation_steps,
                     "lr": optimizer.param_groups[-1]['lr']
-                })
+                }
+                
+                # 添加权重统计信息到SwanLab
+                if args.use_adaptive_weighting and 'sample_weights' in locals():
+                    swanlab_data.update({
+                        "avg_sample_weight": sample_weights.mean().item(),
+                        "min_sample_weight": sample_weights.min().item(),
+                        "max_sample_weight": sample_weights.max().item(),
+                    })
+                
+                swanlab.log(swanlab_data)
 
         # 保存模型
         if (step + 1) % args.save_interval == 0:
@@ -169,6 +203,13 @@ if __name__ == "__main__":
     parser.add_argument("--save_interval", type=int, default=1000, help="模型保存间隔")
     # 添加多卡参数
     parser.add_argument("--gpus", type=str, default='0,1,2,3,4,5,6,7', help="逗号分隔的GPU ID (例如 '0,1,2')")
+    
+    # 自适应加权模块参数
+    parser.add_argument("--use_adaptive_weighting", action="store_true", help="是否使用自适应加权模块")
+    parser.add_argument("--weight_net_hidden_dim", type=int, default=64, help="权重网络隐藏层维度")
+    parser.add_argument("--ema_decay", type=float, default=0.9, help="指数移动平均衰减因子")
+    parser.add_argument("--min_weight", type=float, default=0.1, help="最小样本权重")
+    parser.add_argument("--weight_update_frequency", type=int, default=100, help="权重网络更新频率")
 
     args = parser.parse_args()
 
@@ -207,6 +248,22 @@ if __name__ == "__main__":
     # 初始化模型和分词器
     model, tokenizer = init_model()
     
+    # 初始化自适应加权模块
+    adaptive_weighting_module = None
+    if args.use_adaptive_weighting:
+        adaptive_config = {
+            'weight_net_hidden_dim': args.weight_net_hidden_dim,
+            'ema_decay': args.ema_decay,
+            'min_weight': args.min_weight,
+            'device': args.device,
+            'update_frequency': args.weight_update_frequency
+        }
+        adaptive_weighting_module = create_adaptive_weighting_module(adaptive_config)
+        Logger(f"自适应加权模块已启用: 隐藏维度={args.weight_net_hidden_dim}, "
+               f"EMA衰减={args.ema_decay}, 最小权重={args.min_weight}")
+    else:
+        Logger("使用标准损失函数进行训练")
+    
     # 创建数据集和数据加载器
     train_ds = SFTDataset(args.data_path, tokenizer, max_length=max_seq_len)
     train_loader = DataLoader(
@@ -224,5 +281,9 @@ if __name__ == "__main__":
 
     # 开始训练
     iter_per_epoch = len(train_loader)
+    
+    # 使adaptive_weighting_module在全局可访问
+    global adaptive_weighting_module
+    
     for epoch in range(args.epochs):
         train_epoch(epoch)
