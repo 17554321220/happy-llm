@@ -10,6 +10,9 @@ from transformers import PreTrainedModel, AutoTokenizer
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers import PretrainedConfig
 
+# 导入自适应加权模块
+from adaptive_weighting import AdaptiveWeightingModule, create_adaptive_weighting_module
+
 
 class ModelConfig(PretrainedConfig):
     model_type = "Tiny-K"
@@ -26,6 +29,9 @@ class ModelConfig(PretrainedConfig):
             max_seq_len: int = 512,
             dropout: float = 0.0,
             flash_attn: bool = True,
+            # 自适应加权模块配置
+            use_adaptive_weighting: bool = False,
+            adaptive_weighting_config: dict = None,
             **kwargs,
     ):
         self.dim = dim
@@ -39,6 +45,9 @@ class ModelConfig(PretrainedConfig):
         self.max_seq_len = max_seq_len
         self.dropout = dropout
         self.flash_attn = flash_attn
+        # 自适应加权配置
+        self.use_adaptive_weighting = use_adaptive_weighting
+        self.adaptive_weighting_config = adaptive_weighting_config or {}
         super().__init__(**kwargs)
 
 class RMSNorm(nn.Module):
@@ -314,6 +323,15 @@ class Transformer(PreTrainedModel):
         self.register_buffer("freqs_cos", freqs_cos, persistent=False)
         self.register_buffer("freqs_sin", freqs_sin, persistent=False)
 
+        # 初始化自适应加权模块
+        if args.use_adaptive_weighting:
+            self.adaptive_weighting = create_adaptive_weighting_module(
+                model_dim=args.dim,
+                **args.adaptive_weighting_config
+            )
+        else:
+            self.adaptive_weighting = None
+
         # 初始化所有权重
         self.apply(self._init_weights)
         # 对残差投影进行特殊的缩放初始化
@@ -323,6 +341,7 @@ class Transformer(PreTrainedModel):
 
         # 初始化最后一次前向传播的损失属性
         self.last_loss = None
+        self.last_sample_weights = None  # 存储样本权重
         self.OUT = CausalLMOutputWithPast()  # 输出容器
         self._no_split_modules = [name for name, _ in self.named_modules()]  # 不分割的模块列表
 
@@ -368,11 +387,32 @@ class Transformer(PreTrainedModel):
         if targets is not None:
             # 如果给定了目标，计算损失
             logits = self.output(h)
-            self.last_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=0, reduction='none')
+            # 计算原始损失 (per-sample loss)
+            raw_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), 
+                                     ignore_index=0, reduction='none')
+            
+            # 如果启用自适应加权
+            if self.adaptive_weighting is not None:
+                # 将损失重塑为 [batch_size, seq_len] 然后计算每个样本的平均损失
+                sample_losses = raw_loss.view(_bsz, seqlen).mean(dim=1)  # [batch_size]
+                
+                # 计算加权损失和样本权重
+                weighted_loss, sample_weights = self.adaptive_weighting.compute_weighted_loss(sample_losses)
+                self.last_loss = raw_loss  # 保留原始 per-token loss 用于训练
+                self.last_sample_weights = sample_weights  # 保存样本权重
+                
+                # 使用加权后的样本损失重新计算 per-token loss
+                # 将样本权重扩展到每个token
+                expanded_weights = sample_weights.unsqueeze(1).expand(_bsz, seqlen).contiguous().view(-1)
+                self.last_loss = raw_loss * expanded_weights
+            else:
+                self.last_loss = raw_loss
+                self.last_sample_weights = None
         else:
             # 推理时的小优化：只对最后一个位置的输出进行前向传播
             logits = self.output(h[:, [-1], :]) 
             self.last_loss = None
+            self.last_sample_weights = None
 
         # 设置输出
         self.OUT.__setitem__('logits', logits)
@@ -415,6 +455,30 @@ class Transformer(PreTrainedModel):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx[:, index:] # 只返回生成的token
+    
+    def update_adaptive_weights(self, epoch: int):
+        """
+        更新自适应权重（在每个epoch结束时调用）
+        
+        Args:
+            epoch: 当前epoch数
+        """
+        if self.adaptive_weighting is not None and self.last_sample_weights is not None:
+            # 使用最近一批的样本权重来更新
+            sample_losses = self.last_sample_weights  # 这里简化处理，实际应该传入更全面的损失统计
+            self.adaptive_weighting.update_weights(epoch, sample_losses)
+    
+    def get_adaptive_weight_statistics(self) -> dict:
+        """获取自适应权重统计信息"""
+        if self.adaptive_weighting is not None:
+            return self.adaptive_weighting.get_weight_statistics()
+        return {}
+    
+    def set_adaptive_weighting(self, enabled: bool):
+        """动态启用/禁用自适应加权"""
+        if self.adaptive_weighting is not None:
+            # 通过修改args来控制
+            self.args.use_adaptive_weighting = enabled
 
 if __name__ == '__main__':
     tokenizer = AutoTokenizer.from_pretrained("tokenizer_k")
